@@ -400,19 +400,26 @@ struct ext4_new_group_input {
 
 /*
  * Structure of an inode on the disk
+ *
+ * 盘上 inode 布局（固定 128 字节 = EXT2_GOOD_OLD_INODE_SIZE），与 Linux ext2/3/4
+ * 及 e2fsprogs 使用的内存表示一致；字段偏移见行首十六进制偏移标记（如 00、10、20）。
+ * - i_size + i_size_high：大文件时组成 64 位逻辑长度（ext4 huge file 等特性）。
+ * - i_blocks + l_i_blocks_hi：以 512 字节扇区为单位的“块数”（非文件系统块）。
+ * - i_block[]：传统间接块指针；启用 extent 时在 i_flags 中体现，树头通常占前部槽位。
+ * - osd1/osd2：按 s_creator_os 解释；常见为 linux1/linux2。
  */
 struct ext2_inode {
-/*00*/	__u16	i_mode;		/* File mode */
-	__u16	i_uid;		/* Low 16 bits of Owner Uid */
-	__u32	i_size;		/* Size in bytes */
-	__u32	i_atime;	/* Access time */
-	__u32	i_ctime;	/* Inode change time */
-/*10*/	__u32	i_mtime;	/* Modification time */
-	__u32	i_dtime;	/* Deletion Time */
-	__u16	i_gid;		/* Low 16 bits of Group Id */
-	__u16	i_links_count;	/* Links count */
-	__u32	i_blocks;	/* Blocks count */
-/*20*/	__u32	i_flags;	/* File flags */
+/*00*/	__u16	i_mode;		/* File mode；文件类型与权限(rwx)，见 S_IF* / S_IR* */
+	__u16	i_uid;		/* Low 16 bits of Owner Uid；与 l_i_uid_high 拼 32 位 uid */
+	__u32	i_size;		/* Size in bytes；低 32 位，高位见 i_size_high */
+	__u32	i_atime;	/* Access time；上次访问时间，秒(epoch) */
+	__u32	i_ctime;	/* Inode change time；元数据变更时间 */
+/*10*/	__u32	i_mtime;	/* Modification time；内容修改时间 */
+	__u32	i_dtime;	/* Deletion Time；目录项删除标记时间，回收前非零 */
+	__u16	i_gid;		/* Low 16 bits of Group Id；与 l_i_gid_high 拼 32 位 gid */
+	__u16	i_links_count;	/* Links count；硬链接数，为 0 表示可释放 inode */
+	__u32	i_blocks;	/* Blocks count；占用 512B 片段数（低 32 位），高位见 osd2 */
+/*20*/	__u32	i_flags;	/* File flags；ext2/3/4 特性位，immutable/append/sync 等 */
 	union {
 		struct {
 			__u32	l_i_version; /* was l_i_reserved1 */
@@ -420,12 +427,12 @@ struct ext2_inode {
 		struct {
 			__u32  h_i_translator;
 		} hurd1;
-	} osd1;				/* OS dependent 1 */
-/*28*/	__u32	i_block[EXT2_N_BLOCKS];/* Pointers to blocks */
-/*64*/	__u32	i_generation;	/* File version (for NFS) */
-	__u32	i_file_acl;	/* File ACL */
-	__u32	i_size_high;
-/*70*/	__u32	i_faddr;	/* Fragment address */
+	} osd1;				/* OS dependent 1；Linux：32 位 i_version 前半 */
+/*28*/	__u32	i_block[EXT2_N_BLOCKS];/* Pointers to blocks；数据块映射或 extent 头 */
+/*64*/	__u32	i_generation;	/* File version (for NFS)；打开删除后重用检测 */
+	__u32	i_file_acl;	/* File ACL；扩展 ACL 块号（低位），xattr 可走同机制 */
+	__u32	i_size_high;	/* 文件大小高 32 位，与 i_size 组成总长 */
+/*70*/	__u32	i_faddr;	/* Fragment address；碎片寻址遗留，现代 ext4 常为 0 */
 	union {
 		struct {
 			__u16	l_i_blocks_hi;
@@ -443,14 +450,18 @@ struct ext2_inode {
 			__u16	h_i_gid_high;
 			__u32	h_i_author;
 		} hurd2;
-	} osd2;				/* OS dependent 2 */
+	} osd2;				/* OS dependent 2；Linux：高 16 位块数/ACL/uid/gid、inode 校验和低 16 位 */
 };
 
 /*
  * Permanent part of an large inode on the disk
+ *
+ * “大 inode”在 128 字节 struct ext2_inode 基础上的扩展尾部（常用于 ext4 且
+ * s_inode_size > 128）。i_extra_isize 表示额外有效字节数（自 i_extra_isize
+ * 字段之后计）。纳秒时间与 epoch、metadata_csum 高 16 位、工程配额 project id 等。
  */
 struct ext2_inode_large {
-/*00*/	__u16	i_mode;		/* File mode */
+/*00*/	__u16	i_mode;		/* File mode；同 ext2_inode */
 	__u16	i_uid;		/* Low 16 bits of Owner Uid */
 	__u32	i_size;		/* Size in bytes */
 	__u32	i_atime;	/* Access time */
@@ -472,7 +483,7 @@ struct ext2_inode_large {
 /*28*/	__u32	i_block[EXT2_N_BLOCKS];/* Pointers to blocks */
 /*64*/	__u32	i_generation;	/* File version (for NFS) */
 	__u32	i_file_acl;	/* File ACL */
-	__u32	i_size_high;
+	__u32	i_size_high;	/* 大文件大小高 32 位 */
 /*70*/	__u32	i_faddr;	/* Fragment address */
 	union {
 		struct {
@@ -492,15 +503,15 @@ struct ext2_inode_large {
 			__u32	h_i_author;
 		} hurd2;
 	} osd2;				/* OS dependent 2 */
-/*80*/	__u16	i_extra_isize;
-	__u16	i_checksum_hi;	/* crc32c(uuid+inum+inode) */
-	__u32	i_ctime_extra;	/* extra Change time (nsec << 2 | epoch) */
+/*80*/	__u16	i_extra_isize;	/* 128 之后的扩展区有效长度（自本字段末尾起算） */
+	__u16	i_checksum_hi;	/* crc32c(uuid+inum+inode)；inode csum 高 16 位 */
+	__u32	i_ctime_extra;	/* extra Change time (nsec << 2 | epoch)；纳秒+epoch 编码 */
 	__u32	i_mtime_extra;	/* extra Modification time (nsec << 2 | epoch) */
 	__u32	i_atime_extra;	/* extra Access time (nsec << 2 | epoch) */
-/*90*/	__u32	i_crtime;	/* File creation time */
+/*90*/	__u32	i_crtime;	/* File creation time；文件创建时间（秒） */
 	__u32	i_crtime_extra;	/* extra File creation time (nsec << 2 | epoch)*/
-	__u32	i_version_hi;	/* high 32 bits for 64-bit version */
-/*9c*/	__u32   i_projid;       /* Project ID */
+	__u32	i_version_hi;	/* high 32 bits for 64-bit version；与 l_i_version 组成 64 位 */
+/*9c*/	__u32   i_projid;       /* Project ID；项目配额 ID（ext4 project quota） */
 };
 
 #define EXT4_INODE_CSUM_HI_EXTRA_END	\

@@ -10,6 +10,27 @@
  * %End-Header%
  */
 
+/*
+ * ---------------------------------------------------------------------------
+ * 源码结构说明（中文注释，便于阅读）
+ * ---------------------------------------------------------------------------
+ * 本文件实现用户态“创建 ext2/ext3/ext4 文件系统”的主流程；真正的块分配、
+ * 超级块布局、位图等大多在 libext2fs 中完成，此处负责参数、配置与调用顺序。
+ *
+ * 主要函数：
+ *   PRS()             — 解析命令行、加载 mke2fs.conf(profile)、根据设备与
+ *                       调用名(mkfs.ext4 等)拼出特性集到全局 fs_param
+ *   parse_fs_type()   — 从 progname/fs_type 得到 fs_types 列表，关联配置段
+ *   parse_extended_opts() — 解析 -E/-- 扩展选项，直接改 fs_param 等
+ *   main()            — 选 I/O 后端(可选 undo/tdb)；ext2fs_initialize 打开
+ *                       “虚拟文件系统句柄”；写 UUID/日志/inode 表/根目录；
+ *                       ext2fs_close_free() 刷盘收尾
+ *
+ * mkfs.ext3 / mkfs.ext4：与 mke2fs 为同一二进制，program_name 决定默认类型
+ *（见 PRS 中 parse_fs_type(..., argv[0])）。
+ * ---------------------------------------------------------------------------
+ */
+
 /* Usage: mke2fs [options] device
  *
  * The device may be a block device or a image of one, but this isn't
@@ -76,10 +97,12 @@ extern int optind;
 extern int isatty(int);
 extern FILE *fpopen(const char *cmd, const char *mode);
 
+/* 可执行文件名（如 mke2fs、mkfs.ext4），影响默认 fs 类型与部分默认行为 */
 const char * program_name = "mke2fs";
+/* 目标设备或映像路径；在 PRS() 解析完选项后从 argv[optind] 赋值 */
 static const char * device_name /* = NULL */;
 
-/* Command line options */
+/* 以下为命令行/运行期选项对应的静态状态；PRS() 写入，main() 与各 helper 读取 */
 static int	cflag;
 int	verbose;
 int	quiet;
@@ -106,6 +129,10 @@ static blk64_t journal_location = ~0LL;
 static int	proceed_delay = -1;
 static blk64_t	dev_size;
 
+/*
+ * 超级块“草稿”：PRS() 根据配置与命令行填充各字段与特性位；
+ * ext2fs_initialize() 会据此在 libext2fs 中计算最终布局并生成 ext2_filsys。
+ */
 static struct ext2_super_block fs_param;
 static __u32 zero_buf[4];
 static char *fs_uuid = NULL;
@@ -120,10 +147,12 @@ static char *undo_file;
 
 static int android_sparse_file; /* -E android_sparse */
 
+/* mke2fs.conf 解析结果；亦可通过 MKE2FS_CONFIG 指定路径 */
 static profile_t	profile;
 
 static int sys_page_size = 4096;
 
+/* 超级块 s_errors：内核遇错时行为（continue / remount-ro / panic） */
 static int errors_behavior = 0;
 
 static void usage(void)
@@ -410,12 +439,26 @@ static errcode_t packed_allocate_tables(ext2_filsys fs)
 	return 0;
 }
 
+/*
+ * write_inode_tables — 将每个块组的 inode 表区域写盘（通常为全零）。
+ *
+ * 参数：
+ *   lazy_flag     — 对应 main 里的 lazy_itable_init：为真时只清零“可能很快会被
+ *                   用到的”inode 表前缀块数，其余寄托于内核挂载时 lazy 初始化；
+ *                   为假则写满该组 inode 表所占的全部块 (inode_blocks_per_group)。
+ *   itable_zeroed — 整盘 TRIM 等已保证读为全零时为真，则跳过 ext2fs_zero_blocks2，
+ *                   但仍可置 EXT2_BG_INODE_ZEROED 告诉内核不必再清。
+ *
+ * 前置：alloc_tables（或等价路径）已为每组设定 ext2fs_inode_table_loc。
+ * 注意：reserved inode（如 1～10）的盘上内容若在 metadata_csum 下需有效校验和，
+ *       因而末尾调用 write_reserved_inodes。
+ */
 static void write_inode_tables(ext2_filsys fs, int lazy_flag, int itable_zeroed)
 {
 	errcode_t	retval;
 	blk64_t		blk;
 	dgrp_t		i;
-	int		num;
+	int		num;		/* 本组实际要清零的连续块数 */
 	struct ext2fs_numeric_progress_struct progress;
 
 	ext2fs_numeric_progress_init(fs, &progress,
@@ -425,20 +468,32 @@ static void write_inode_tables(ext2_filsys fs, int lazy_flag, int itable_zeroed)
 	for (i = 0; i < fs->group_desc_count; i++) {
 		ext2fs_numeric_progress_update(fs, &progress, i);
 
+		/* 该块组 inode 表起点块号（在块位图中已预留） */
 		blk = ext2fs_inode_table_loc(fs, i);
+		/* non-lazy：整段 inode 表占用的块数 */
 		num = fs->inode_blocks_per_group;
 
-		if (lazy_flag)
+		if (lazy_flag) {
+			/*
+			 * 仅清零“会使用到的”前缀：每组有效 inode =
+			 * s_inodes_per_group - bg_itable_unused（未分配给用户的槽位）。
+			 */
 			num = ext2fs_div_ceil((fs->super->s_inodes_per_group -
 					       ext2fs_bg_itable_unused(fs, i)) *
 					      EXT2_INODE_SIZE(fs->super),
 					      EXT2_BLOCK_SIZE(fs->super));
+		}
 		if (!lazy_flag || itable_zeroed) {
 			/* The kernel doesn't need to zero the itable blocks */
+			/*
+			 * 置块组标志 EXT2_BG_INODE_ZEROED：内核可把未写部分视为已零化，
+			 * 与 lazy_itable_init 配合减少 mkfs 时间与 I/O。
+			 */
 			ext2fs_bg_flags_set(fs, i, EXT2_BG_INODE_ZEROED);
 			ext2fs_group_desc_csum_set(fs, i);
 		}
 		if (!itable_zeroed) {
+			/* 向设备写入 num 块零；出错时 blk/num 由库回传出错位置信息 */
 			retval = ext2fs_zero_blocks2(fs, blk, num, &blk, &num);
 			if (retval) {
 				fprintf(stderr, _("\nCould not write %d "
@@ -448,6 +503,7 @@ static void write_inode_tables(ext2_filsys fs, int lazy_flag, int itable_zeroed)
 				exit(1);
 			}
 		}
+		/* MKE2FS_SYNC / profile sync_kludge：强制分段 flush，减慢但利于调试陈旧内核 */
 		if (sync_kludge) {
 			if (sync_kludge == 1)
 				io_channel_flush(fs->io);
@@ -459,6 +515,7 @@ static void write_inode_tables(ext2_filsys fs, int lazy_flag, int itable_zeroed)
 				      _("done                            \n"));
 
 	/* Reserved inodes must always have correct checksums */
+	/* inode 1～FIRST_INO-1 若开启 metadata_csum，必须写好带校验的占位 inode */
 	if (ext2fs_has_feature_metadata_csum(fs->super))
 		write_reserved_inodes(fs);
 }
@@ -794,6 +851,10 @@ static int set_os(struct ext2_super_block *sb, char *os)
 
 #define PATH_SET "PATH=/sbin"
 
+/*
+ * 解析 -E 扩展选项字符串（逗号分隔的 key 或 key=value），直接修改 param（通常即 fs_param）。
+ * 与 tune2fs 共享部分 token 名；非法组合在此处或后续 PRS 校验中报错。
+ */
 static void parse_extended_opts(struct ext2_super_block *param,
 				const char *opts)
 {
@@ -1298,6 +1359,16 @@ static int profile_has_subsection(profile_t prof, const char *section,
 	return ret;
 }
 
+/*
+ * 解析“文件系统类型”与 mke2fs.conf 中的 [fs_types] 配置段。
+ *
+ * 逻辑要点：
+ * - 若调用名为 mkfs.ext4，则 basename 去前缀 mkfs. 得到 "ext4"，作为列表首项；
+ * - 再根据卷大小选 usage 档：floppy/small/default/big/huge，拼进列表供逐段查配置；
+ * - 返回值 char** 供 get_*_from_profile() 自后向前覆盖查询（后者优先）。
+ *
+ * 返回值需由调用方 free 各字符串及数组（见 main 末尾）。
+ */
 static char **parse_fs_type(const char *fs_type,
 			    const char *usage_types,
 			    struct ext2_super_block *sb,
@@ -1537,6 +1608,23 @@ out:
 }
 #endif
 
+/*
+ * PRS = Parameter Recognition Section（历史命名）：本函数完成“建盘前”几乎全部
+ * 全局状态准备，main() 第一句话即调用 PRS(argc, argv)。
+ *
+ * 阶段概览：
+ *  (1) PATH 注入 /sbin，保证可 fork 到 badblocks 等
+ *  (2) 载入 profile（mke2fs.conf），初始化 fs_param（动态 rev、特性初值）
+ *  (3) getopt 解析 -b/-O/-E/-T/-J 等，写入 journal_size、extended_opts 等
+ *  (4) device_name = argv[optind++]，可选第二参数为文件系统块数
+ *  (5) check_mount：防止对已挂载设备格式化
+ *  (6) ext2fs_get_device_size2 / 普通文件 create 确定 dev_size 与 fs_blocks_count
+ *  (7) parse_fs_type + edit_feature + profile：合并 ext4 默认特性、块大小、inode 等
+ *  (8) 大量一致性检查（64bit 与 extent、bigalloc、meta_bg 与 resize_inode…）
+ *  (9) check_plausibility：设备上是否已有文件系统等交互/提示
+ *
+ * 注意：fs_blocks_count 与 blocksize 单位在流程中会切换，见函数内英文 NOTE。
+ */
 static void PRS(int argc, char *argv[])
 {
 	int		b, c, flags;
@@ -1901,6 +1989,7 @@ profile_error:
 	}
 	if ((optind == argc) && !show_version_only)
 		usage();
+	/* 首个非选项参数：块设备或镜像文件路径 */
 	device_name = argv[optind++];
 
 	if (!quiet || show_version_only)
@@ -2056,6 +2145,9 @@ profile_error:
 	 * We have the file system (or device) size, so we can now
 	 * determine the appropriate file system types so the fs can
 	 * be appropriately configured.
+	 *
+	 * 下文：据 fs_types 链表从 mke2fs.conf 拉取 base_features / features /
+	 * blocksize / inode_ratio 等，并与 -O/-E 命令行合并。
 	 */
 	fs_types = parse_fs_type(fs_type, usage_types, &fs_param,
 				 fs_blocks_count ? fs_blocks_count : dev_size,
@@ -2688,6 +2780,10 @@ _("128-byte inodes cannot handle dates beyond 2038 and are deprecated\n"));
 		proceed_question(proceed_delay);
 }
 
+/*
+ * 判断是否应启用可撤销 I/O（undo_io + tdb）：与 metadata 校验、lazy_itable_init
+ * 等相关；若打开设备失败则交由后续 mke2fs 流程报错。
+ */
 static int should_do_undo(const char *name)
 {
 	errcode_t retval;
@@ -2739,6 +2835,11 @@ open_err_out:
 	return retval;
 }
 
+/*
+ * 可选：用 undo_io_manager 包装底层 I/O，配合 tdb 记录变更，供 e2undo 恢复。
+ * - 若 -z 给出路径则直接使用该 undo 文件；
+ * - 否则读配置/环境决定 undo 目录，生成 mke2fs-<dev>.e2undo。
+ */
 static int mke2fs_setup_tdb(const char *name, io_manager *io_ptr)
 {
 	errcode_t retval = ENOMEM;
@@ -2825,6 +2926,9 @@ err:
 	return retval;
 }
 
+/*
+ * 对整卷尝试 blkdiscard/TRIM（分大步长）。成功且设备 discard 返回全零时可省 inode 表清零。
+ */
 static int mke2fs_discard_device(ext2_filsys fs)
 {
 	struct ext2fs_numeric_progress_struct progress;
@@ -2872,6 +2976,10 @@ static int mke2fs_discard_device(ext2_filsys fs)
 	return retval;
 }
 
+/*
+ * bigalloc：块级位图上的空闲区间需按“簇”汇总到块组描述符与超级块的空闲计数；
+ * 格式化末尾在关闭文件系统前调用。
+ */
 static void fix_cluster_bg_counts(ext2_filsys fs)
 {
 	blk64_t		block, num_blocks, last_block, next;
@@ -2913,6 +3021,9 @@ static void fix_cluster_bg_counts(ext2_filsys fs)
 	ext2fs_free_blocks_count_set(fs->super, tot_free);
 }
 
+/*
+ * 初始化 usr/grp（及可选 prj）配额 inode 与使用量元数据。
+ */
 static int create_quota_inodes(ext2_filsys fs)
 {
 	quota_ctx_t qctx;
@@ -2936,6 +3047,9 @@ static int create_quota_inodes(ext2_filsys fs)
 	return 0;
 }
 
+/*
+ * 内核遇错时的默认策略：优先读 mke2fs.conf 的 errors=，再用命令行 -e 覆盖。
+ */
 static errcode_t set_error_behavior(ext2_filsys fs)
 {
 	char	*arg = NULL;
@@ -2968,25 +3082,52 @@ try_user:
 	return 0;
 }
 
+/*
+ * main() — 格式化并写回 ext2/3/4 文件系统的总控流程。
+ *
+ * 前置：在进入 main 之前全局量多为默认；在声明局部变量并完成 NLS 初始化后，
+ *       首先调用 PRS(argc, argv)，之后下列全局状态才完整可用：
+ *   device_name, fs_param, fs_types, profile, journal_*, quiet, force, …
+ *
+ * 阶段与代码对应关系：
+ *   A. 本地化(NLS) + PRS — 解析命令行、加载 mke2fs.conf、填充 fs_param
+ *   B. 选择 io_manager（测试用 test_io、可撤销 undo_io）并 ext2fs_initialize
+ *   C. set_error_behavior、metadata_csum 与 csum_seed 一致性检查
+ *   D. figure_journal_size、io_channel 选项（undo 缓冲、分区 offset）
+ *   E. 可选 discard(TRIM)、测试文件系统标志、内核统计用 s_kbytes_written
+ *   F. zap_sector 擦除旧超级块镜像区；UUID / csum_seed / 目录哈希 / 定期 fsck 字段
+ *   G. 创建者 OS、卷标、最后挂载点、加密默认算法、metadata 校验算法类型
+ *   H. show_stats；若 -n(noaction) 仅打印后退出
+ *   I. 若仅为 journal 设备文件系统则 create_journal_dev 后退出
+ *   J. 坏块文件或 -c 检测；handle_bad_blocks；allocate_tables；overhead 统计
+ *   K. -S(super_only) 与正常路径：写 inode 表、根目录、lost+found、坏块 inode、resize 预留
+ *   L. 外置日志设备或内置 journal inode；MMP；s_overhead_clusters；quota；hugefiles；-d 填充
+ *   M. ext2fs_close_free 落盘；释放错误表与 profile、fs_types
+ */
 int main (int argc, char *argv[])
 {
+	/* 各步 errcode；close 失败时置 1 作为 main 返回值 */
 	errcode_t	retval = 0;
+	/* libext2fs 文件系统句柄：挂 super、块组描述符、位图、io channel */
 	ext2_filsys	fs;
-	badblocks_list	bb_list = 0;
-	badblocks_iterate	bb_iter;
-	blk_t		blk;
-	struct ext2fs_journal_params	jparams = {0};
+	badblocks_list	bb_list = 0;	/* -l 或 badblocks 得到的坏块集合 */
+	badblocks_iterate	bb_iter;	/* 遍历 bb_list 的状态机 */
+	blk_t		blk;		/* 当前迭代的坏块号 */
+	struct ext2fs_journal_params	jparams = {0}; /* 日志与 fast_commit 块数 */
 	unsigned int	i, checkinterval;
-	int		max_mnt_count;
-	int		val, hash_alg;
-	int		flags;
-	int		old_bitmaps;
-	io_manager	io_ptr;
-	char		opt_string[40];
-	char		*hash_alg_str;
+	int		max_mnt_count;	/* 关闭前拷贝 s_max_mnt_count，供结尾提示 */
+	int		val, hash_alg;	/* val：UUID 抖动累加；hash_alg：目录索引哈希 */
+	int		flags;		/* EXT2_FLAG_*，传入 ext2fs_initialize */
+	int		old_bitmaps;	/* profile old_bitmaps=1 则关闭 64 位位图接口 */
+	io_manager	io_ptr;		/* 实际块读写：unix_io / undo_io / test_io */
+	char		opt_string[40];	/* "tdb_data_size=…" "offset=…" 等 */
+	char		*hash_alg_str;	/* 来自 profile 的 hash_alg 字符串，随后释放 */
+	/* TRIM 成功且设备读回全零时，认为 inode 表无需再写零 */
 	int		itable_zeroed = 0;
+	/* 元数据已占簇数，最后写入 super->s_overhead_clusters（非 super_only） */
 	blk64_t		overhead;
 
+	/* 启用 gettext，使 com_err/printf 等走翻译目录 */
 #ifdef ENABLE_NLS
 	setlocale(LC_MESSAGES, "");
 	setlocale(LC_CTYPE, "");
@@ -2994,9 +3135,16 @@ int main (int argc, char *argv[])
 	textdomain(NLS_CAT_NAME);
 	set_com_err_gettext(gettext);
 #endif
+	/*
+	 * PRS：解析选项、读配置、确定设备与大小、合并特性位到 fs_param。
+	 * 此后不得再假定 fs_param 为零；device_name/fs_types 等均已就绪。
+	 */
 	PRS(argc, argv);
 
+	/* ========== 以下为在块设备上构造 ext2_filsys 并写元数据 ========== */
+
 #ifdef CONFIG_TESTIO_DEBUG
+	/* 调试：TEST_IO_* 环境变量可把 I/O 重定向到 test_io_manager */
 	if (getenv("TEST_IO_FLAGS") || getenv("TEST_IO_BLOCK")) {
 		io_ptr = test_io_manager;
 		test_io_backing_manager = unix_io_manager;
@@ -3004,6 +3152,7 @@ int main (int argc, char *argv[])
 #endif
 		io_ptr = unix_io_manager;
 
+	/* 需要可撤销格式化时，将 io_ptr 换为 undo_io_manager 并配 tdb 路径 */
 	if (undo_file != NULL || should_do_undo(device_name)) {
 		retval = mke2fs_setup_tdb(device_name, &io_ptr);
 		if (retval)
@@ -3012,6 +3161,8 @@ int main (int argc, char *argv[])
 
 	/*
 	 * Initialize the superblock....
+	 * 在 libext2fs 中：打开底层 channel、依据 fs_param 分配 group_desc /
+	 * block_map / inode_map 等；尚未写入完整的 inode 表内容。
 	 */
 	flags = EXT2_FLAG_EXCLUSIVE;
 	if (direct_io)
@@ -3027,6 +3178,7 @@ int main (int argc, char *argv[])
 	 */
 	if (!quiet)
 		flags |= EXT2_FLAG_PRINT_PROGRESS;
+	/* Android 稀疏映像：伪设备名传给 sparse_io_manager，非块设备路径 */
 	if (android_sparse_file) {
 		char *android_sparse_params = malloc(strlen(device_name) + 48);
 
@@ -3051,12 +3203,14 @@ int main (int argc, char *argv[])
 	}
 	fs->progress_ops = &ext2fs_numeric_progress_ops;
 
-	/* Set the error behavior */
+	/* 写入 super->s_errors：profile errors= 与命令行 -e 的合并结果 */
 	retval = set_error_behavior(fs);
 	if (retval)
 		usage();
 
-	/* Check the user's mkfs options for metadata checksumming */
+	/*
+	 * metadata_csum：若未开 extent/64bit，校验覆盖范围会变弱，此处仅提示不改配置。
+	 */
 	if (!quiet &&
 	    !ext2fs_has_feature_journal_dev(fs->super) &&
 	    ext2fs_has_feature_metadata_csum(fs->super)) {
@@ -3075,6 +3229,7 @@ int main (int argc, char *argv[])
 				 "Pass -O 64bit to rectify.\n"));
 	}
 
+	/* csum_seed 依赖 metadata_csum，否则内核无法解释校验种子 */
 	if (ext2fs_has_feature_csum_seed(fs->super) &&
 	    !ext2fs_has_feature_metadata_csum(fs->super)) {
 		printf("%s", _("The metadata_csum_seed feature "
@@ -3082,11 +3237,17 @@ int main (int argc, char *argv[])
 		exit(1);
 	}
 
-	/* Calculate journal blocks */
+	/*
+	 * 根据 -J / journal_size 与 fs 布局，计算内置日志（及 fast commit）占用的块数，
+	 * 结果写入 jparams，供后面 ext2fs_add_journal_inode3 使用。
+	 */
 	if (!journal_device && ((journal_size) ||
 	    ext2fs_has_feature_journal(&fs_param)))
 		figure_journal_size(&jparams, journal_size, journal_fc_size, fs);
 
+	/*
+	 * 为 undo/tdb 通道设置写缓冲大小；若格式化目标在分区中段，传 offset 给 channel。
+	 */
 	sprintf(opt_string, "tdb_data_size=%d", fs->blocksize <= 4096 ?
 		32768 : fs->blocksize * 8);
 	io_channel_set_options(fs->io, opt_string);
@@ -3096,6 +3257,7 @@ int main (int argc, char *argv[])
 	}
 
 	/* Can't undo discard ... */
+	/* 整盘 discard 与 undo_io 语义不兼容故跳过；成功且返回全零可读可省 inode 表写零 */
 	if (!noaction && discard && dev_size && (io_ptr != undo_io_manager)) {
 		retval = mke2fs_discard_device(fs);
 		if (!retval && io_channel_discard_zeroes_data(fs->io)) {
@@ -3109,9 +3271,13 @@ int main (int argc, char *argv[])
 		}
 	}
 
+	/* 内核测试补丁用：将超级块测试标志传播到已打开句柄 */
 	if (fs_param.s_flags & EXT2_FLAGS_TEST_FILESYS)
 		fs->super->s_flags |= EXT2_FLAGS_TEST_FILESYS;
 
+	/*
+	 * 若启用若干现代特性，令 s_kbytes_written=1，便于内核统计已写入字节数。
+	 */
 	if (ext2fs_has_feature_flex_bg(&fs_param) ||
 	    ext2fs_has_feature_huge_file(&fs_param) ||
 	    ext2fs_has_feature_gdt_csum(&fs_param) ||
@@ -3121,13 +3287,15 @@ int main (int argc, char *argv[])
 		fs->super->s_kbytes_written = 1;
 
 	/*
-	 * Wipe out the old on-disk superblock
+	 * 擦除盘上原超级块备份区域（约扇区 2 起共 6 扇区），减小误认旧文件系统的概率。
+	 * （主超级块在字节 1024 处，另有其它布局细节由 libext2fs 维护。）
 	 */
 	if (!noaction)
 		zap_sector(fs, 2, 6);
 
 	/*
-	 * Parse or generate a UUID for the filesystem
+	 * UUID：-U 可指定 null/clear/time/random 或固定串；默认随机。
+	 * metadata_csum_seed 时还需要由 UUID 派生 s_checksum_seed。
 	 */
 	if (fs_uuid) {
 		if ((strcasecmp(fs_uuid, "null") == 0) ||
@@ -3152,7 +3320,8 @@ int main (int argc, char *argv[])
 	ext2fs_init_csum_seed(fs);
 
 	/*
-	 * Initialize the directory index variables
+	 * HTree 目录索引：默认哈希算法来自 profile（如 half_md4），
+	 * hash_seed 可由 -E 事先指定，否则用随机 UUID 风格种子。
 	 */
 	hash_alg_str = get_string_from_profile(fs_types, "hash_alg",
 					       "half_md4");
@@ -3243,18 +3412,28 @@ int main (int argc, char *argv[])
 	if (ext2fs_has_feature_metadata_csum(fs->super))
 		fs->super->s_checksum_type = EXT2_CRC32C_CHKSUM;
 
+	/* 人类可读摘要；-n 时仍需看见统计再 dry-run 退出 */
 	if (!quiet || noaction)
 		show_stats(fs);
 
+	/* show_stats 后退出：跳过坏块测试、allocate_tables、写 inode/日志及 ext2fs_close 等后续步骤 */
 	if (noaction)
 		exit(0);
 
+	/*
+	 * 整个块设备只做 journal 时用：整块格式化为日志设备，
+	 * 写完即 close 退出，不参与普通文件的 inode 表/根目录路径。
+	 */
 	if (ext2fs_has_feature_journal_dev(fs->super)) {
 		create_journal_dev(fs);
 		printf("\n");
 		exit(ext2fs_close_free(&fs) ? 1 : 0);
 	}
 
+	/*
+	 * 坏块来源：-l 文件或 -c 调 badblocks；handle_bad_blocks 校验关键元数据区不可坏，
+	 * 并将其余坏块在位图中标为已占用。
+	 */
 	if (bad_blocks_filename)
 		read_bb_file(fs, &bb_list, bad_blocks_filename);
 	if (cflag)
@@ -3262,6 +3441,9 @@ int main (int argc, char *argv[])
 	handle_bad_blocks(fs, bb_list);
 
 	fs->stride = fs_stride = fs->super->s_raid_stride;
+	/*
+	 * 按最终 block_map 为各块组分配 inode 表/位图的实际块号（或由 packed 路径铺设）。
+	 */
 	if (!quiet)
 		printf("%s", _("Allocating group tables: "));
 	if (ext2fs_has_feature_flex_bg(fs->super) &&
@@ -3294,6 +3476,10 @@ int main (int argc, char *argv[])
 		ext2fs_badblocks_list_iterate_end(bb_iter);
 	}
 
+	/*
+	 * overhead：先在未计坏块的位图上换算子簇，再统计已用簇数；
+	 * 之后把坏块重新标回位图以免影响数据区分配语义。
+	 */
 	retval = ext2fs_convert_subcluster_bitmap(fs, &fs->block_map);
 	if (retval) {
 		com_err(program_name, retval, "%s",
@@ -3323,6 +3509,7 @@ int main (int argc, char *argv[])
 		ext2fs_badblocks_list_iterate_end(bb_iter);
 	}
 
+	/* -S：仅重写超级块/元数据关键信息，不交 inode 表、不删数据，留给 e2fsck 挽救 */
 	if (super_only) {
 		check_plausibility(device_name, CHECK_FS_EXIST, NULL);
 		printf(_("%s may be further corrupted by superblock rewrite\n"),
@@ -3342,6 +3529,8 @@ int main (int argc, char *argv[])
 				ext2fs_bg_itable_unused_set(fs, i, 0);
 		}
 	} else {
+		/* 正常格式化：卷尾清零以避免残留 RAID 签名；再写 inode 表与必备目录 */
+
 		/* rsv must be a power of two (64kB is MD RAID sb alignment) */
 		blk64_t rsv = 65536 / fs->blocksize;
 		blk64_t blocks = ext2fs_blocks_count(fs->super);
@@ -3385,6 +3574,7 @@ int main (int argc, char *argv[])
 		}
 	}
 
+	/* --------- 日志：外部设备或 inode 内置（ext2fs_add_journal_*）--------- */
 	if (journal_device) {
 		ext2_filsys	jfs;
 
@@ -3420,6 +3610,10 @@ int main (int argc, char *argv[])
 		free(journal_device);
 	} else if ((journal_size) ||
 		   ext2fs_has_feature_journal(&fs_param)) {
+		/*
+		 * 内置 journal：journal_size 来自 -J/-m 等与 profile；
+		 * 若没有足够块可容纳日志则清除 journal 特性并跳过。
+		 */
 		overhead += EXT2FS_NUM_B2C(fs, jparams.num_journal_blocks + jparams.num_fc_blocks);
 		if (super_only) {
 			printf("%s", _("Skipping journal creation in super-only mode\n"));
@@ -3448,6 +3642,7 @@ int main (int argc, char *argv[])
 			printf("%s", _("done\n"));
 	}
 no_journal:
+	/* MMP：多挂载防护，在 super 与固定块写心跳，防止两台主机同时挂载同一卷 */
 	if (!super_only &&
 	    ext2fs_has_feature_mmp(fs->super)) {
 		retval = ext2fs_mmp_init(fs);
@@ -3463,6 +3658,7 @@ no_journal:
 			       fs->super->s_mmp_update_interval);
 	}
 
+	/* overhead 计入 first_data_block（引导块等）；填入 super 供 df/统计近似用 */
 	overhead += fs->super->s_first_data_block;
 	if (!super_only)
 		fs->super->s_overhead_clusters = overhead;
@@ -3472,10 +3668,13 @@ no_journal:
 	if (ext2fs_has_feature_quota(&fs_param))
 		create_quota_inodes(fs);
 
+	/* -T huge_* 等 profile 可要求预建“巨文件”占位块 */
 	retval = mk_hugefiles(fs, device_name);
 	if (retval)
 		com_err(program_name, retval, "while creating huge files");
-	/* Copy files from the specified directory */
+	/*
+	 * -d：把宿主目录树递归拷入新文件系统根（需 create_inode / populate_fs 支持）。
+	 */
 	if (src_root_dir) {
 		if (!quiet)
 			printf("%s", _("Copying files into the device: "));
@@ -3490,6 +3689,10 @@ no_journal:
 			printf("%s", _("done\n"));
 	}
 
+	/*
+	 * ext2fs_close_free：将脏超级块、块组描述符、位图及已写块刷到设备并释放句柄。
+	 * （此前各步多通过 libext2fs 标记 DIRTY，由 close 路径统一落地。）
+	 */
 	if (!quiet)
 		printf("%s", _("Writing superblocks and "
 		       "filesystem accounting information: "));
@@ -3506,6 +3709,7 @@ no_journal:
 			print_check_message(max_mnt_count, checkinterval);
 	}
 
+	/* 注销 com_err 表、释放 profile；fs_types[] 中字符串为 strdup 分配需逐个 free */
 	remove_error_table(&et_ext2_error_table);
 	remove_error_table(&et_prof_error_table);
 	profile_release(profile);
